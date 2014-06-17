@@ -1,0 +1,247 @@
+#!/bin/sh
+#
+# ipset	Startup script for ipset
+#
+# chkconfig: - 07 93
+# description:	Starts, stops and saves ipset
+#
+# config: /etc/sysconfig/ipset
+# config: /etc/sysconfig/ipset-config
+#
+### BEGIN INIT INFO
+# Provides: ipset
+# Required-Start:
+# Required-Stop:
+# Default-Stop: 0 1 2 3 4 5 6
+# Short-Description: start and stop ipset
+# Description: Start, stop and save ipset
+### END INIT INFO
+
+# Source function library.
+. /etc/init.d/functions
+
+IPSET=ipset
+IPSET_DATA=/etc/sysconfig/$IPSET
+IPSET_CONFIG=/etc/sysconfig/${IPSET}-config
+VAR_SUBSYS_IPSET=/var/lock/subsys/$IPSET
+
+if [ ! -x /usr/sbin/$IPSET ]; then
+    echo -n $"${IPSET}: /usr/sbin/$IPSET does not exist."; warning; echo
+    exit 5
+fi
+
+
+# Default ipset configuration:
+IPSET_MODULES_UNLOAD="yes"
+IPSET_SAVE_ON_STOP="no"
+IPSET_SAVE_ON_RESTART="no"
+IPSET_STATUS_NUMERIC="yes"
+IPSET_STATUS_SORTED="yes"
+
+# Load ipset configuration.
+[ -f "$IPSET_CONFIG" ] && . "$IPSET_CONFIG"
+
+# Ipset modules
+IPSET_MODULES=($(lsmod | awk "/^ip_set[_ ]/ {print \$1}"))
+
+rmmod_r() {
+    # Unload module with all referring modules.
+    # At first all referring modules will be unloaded, then the module itself.
+    local mod=$1
+    local ret=0
+    local ref=
+
+    # Get referring modules.
+    ref=$(lsmod | awk "/^${mod}/ { print \$4; }" | tr ',' ' ') 
+
+    # recursive call for all referring modules
+    for i in $ref; do
+	rmmod_r $i
+	let ret+=$?;
+    done
+
+    # Unload module.
+    # The extra test is for 2.6: The module might have autocleaned,
+    # after all referring modules are unloaded.
+    if grep -q "^${mod}" /proc/modules ; then
+	modprobe -r $mod > /dev/null 2>&1
+	res=$?
+	[ $res -eq 0 ] || echo -n " $mod"
+	let ret+=$res;
+    fi
+
+    return $ret
+}
+
+flush_n_delete() {
+    local use=
+    
+    # Check if ipset module is loaded.
+    [ -z "$IPSET_MODULES" ] && return 0
+
+    # Get ipt_set modules use count.
+    use=$(lsmod | awk "/^ipt_(set|SET) / {print \$3}")
+    # Exit if ipset is in use.
+    if [ -n "$use" ]; then
+        for i in $use; do
+	    if [ $i -gt 0 ]; then
+		echo -n $"${IPSET}: Set is in use, operation not permitted."; warning; echo
+		exit 1
+	    fi           
+        done
+    fi
+
+    # Flush ipset rules and delete sets.
+    echo -n $"${IPSET}: Flushing ipset rules: "
+    ret=0
+
+    # Flush ipset rules.
+    $IPSET -F;
+    let ret+=$?;
+
+    # Delete ipset sets.
+    $IPSET -X;
+    let ret+=$?;
+
+
+    [ $ret -eq 0 ] && success || failure
+    echo
+    return $ret
+}
+
+
+start() {
+    # Do not start if there is no config file.
+    [ ! -f "$IPSET_DATA" ] && return 6
+    
+    flush_n_delete
+
+    echo -n $"${IPSET}: Applying ipset rules: "    
+
+    $IPSET --restore < $IPSET_DATA
+    if [ $? -eq 0 ]; then
+	success; echo
+    else
+	failure; echo; return 1
+    fi
+    
+    touch $VAR_SUBSYS_IPSET
+    return $ret
+}
+
+stop() {
+    # Do not stop if ipset module is not loaded.
+    [ -z "$IPSET_MODULES" ] && return 0
+
+    flush_n_delete
+    
+    if [ "x$IPSET_MODULES_UNLOAD" = "xyes" ]; then
+	echo -n $"${IPSET}: Unloading modules: "
+	ret=0
+	for mod in ${IPSET_MODULES[*]}; do
+	    rmmod_r $mod
+	    let ret+=$?;
+	done
+	[ $ret -eq 0 ] && success || failure
+	echo
+    fi
+    
+    rm -f $VAR_SUBSYS_IPSET
+    return $ret
+}
+
+save() {
+    # Check if ipset module is loaded
+    [ -z "$IPSET_MODULES" ] && return 0
+
+    echo -n $"${IPSET}: Saving ipset rules to $IPSET_DATA: "
+
+    ret=0
+    TMP_FILE=$(/bin/mktemp -q /tmp/$IPSET.XXXXXX) \
+	&& chmod 600 "$TMP_FILE" \
+	&& $IPSET --save > $TMP_FILE 2>/dev/null \
+	&& size=$(stat -c '%s' $TMP_FILE) && [ $size -gt 0 ] \
+	|| ret=1
+    if [ $ret -eq 0 ]; then
+	if [ -e $IPSET_DATA ]; then
+	    cp -f $IPSET_DATA $IPSET_DATA.save \
+		&& chmod 600 $IPSET_DATA.save \
+		|| ret=1
+	fi
+	if [ $ret -eq 0 ]; then
+	    cp -f $TMP_FILE $IPSET_DATA \
+		&& chmod 600 $IPSET_DATA \
+	        || ret=1
+	fi
+    fi
+    [ $ret -eq 0 ] && success || failure
+    echo
+    rm -f $TMP_FILE
+    return $ret
+}
+
+status() {
+    # Do not print status if lockfile is missing and ipset modules are not 
+    # loaded.
+    if [ ! -f "$VAR_SUBSYS_IPSET" -a -z "$IPSET_MODULES" ]; then
+	echo $"${IPSET}: Ipset is not running."
+	return 3
+    fi
+    # Check if ipset modules are loaded
+    if [ -z "$IPSET_MODULES" ]; then
+	echo $"${IPSET}: Ipset modules are not loaded."
+	return 3
+    fi
+    NUM=
+    [ "x$IPSET_STATUS_NUMERIC" = "xyes" ] && NUM="-n"
+    SORT=
+    [ "x$IPSET_STATUS_SORTED" = "xyes" ] && SORT="--sorted"
+
+	$IPSET --list $NUM $SORT && echo
+
+    return 0
+}
+
+restart() {
+    [ "x$IPSET_SAVE_ON_RESTART" = "xyes" ] && save
+    stop
+    start
+}
+
+
+case "$1" in
+    start)
+	[ -f "$VAR_SUBSYS_IPSET" ] && exit 0
+	start
+	RETVAL=$?
+	;;
+    stop)
+	[ "x$IPSET_SAVE_ON_STOP" = "xyes" ] && save
+	stop
+	RETVAL=$?
+	;;
+    restart|force-reload)
+	restart
+	RETVAL=$?
+	;;
+    condrestart|try-restart)
+	[ ! -e "$VAR_SUBSYS_IPSET" ] && exit 0
+	restart
+	RETVAL=$?
+	;;
+    status)
+	status
+	RETVAL=$?
+	;;
+    save)
+	save
+	RETVAL=$?
+	;;
+    *)
+	echo $"Usage: ${IPSET} {start|stop|restart|condrestart|status|save}"
+	RETVAL=2
+	;;
+esac
+
+exit $RETVAL
+

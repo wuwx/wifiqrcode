@@ -1,0 +1,93 @@
+== README
+
+WifiQRCode是一个用于对访客进行网络接入认证的程序
+
+=== 认证流程
+* 访客登录不设密码的Wifi或连接网线
+* 访客使用浏览器访问任何网站均跳到认证页
+* 主人使用手机扫描二维码访问二维码网址
+* 主人根据网页提示对访问访问进行授权
+* 访客被授权后可正常访问互联网
+
+=== 认证原理
+* 借助二维码携带管理地址与访问的网络配置信息
+* 使用 iptables 的 recent 模块进行认证匹配
+
+=== 安装步骤
+* 将本项目部署到网络网关的 web 目录中
+* 将 iptables 配置文件导入运行
+
+=== iptables
+
+  # Firewall configuration written by system-config-firewall
+  # Manual customization of this file is not recommended.
+  *nat
+  # 未被认证过的访客不通过的访客会被重定向到本地 80
+  -A PREROUTING -m set ! --match-set WifiQRCode src,src -j SET --del-set WifiQRCode src,src 
+  -A PREROUTING -m set ! --match-set WifiQRCode src,src -m recent --remove --name WifiQRCode3600 --rsource 
+  -A PREROUTING -m set ! --match-set WifiQRCode src,src -m recent --remove --name WifiQRCode14400 --rsource 
+  -A PREROUTING -m set ! --match-set WifiQRCode src,src -m recent --remove --name WifiQRCode32400 --rsource 
+  -A PREROUTING -p tcp -m recent --rcheck --seconds 3600 --name WifiQRCode3600 --rsource -j ACCEPT
+  -A PREROUTING -p tcp -m recent --rcheck --seconds 14400 --name WifiQRCode14400 --rsource -j ACCEPT
+  -A PREROUTING -p tcp -m recent --rcheck --seconds 32400 --name WifiQRCode32400 --rsource -j ACCEPT
+  -A PREROUTING -p tcp -m tcp --dport 80 -j REDIRECT
+  # 对外的请求会被 NAT
+  -A POSTROUTING -j MASQUERADE
+  COMMIT
+  
+  *filter
+  :INPUT ACCEPT [0:0]
+  :FORWARD ACCEPT [0:0]
+  :OUTPUT ACCEPT [0:0]
+  
+  -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+  -A INPUT -p icmp -j ACCEPT
+  -A INPUT -i lo -j ACCEPT
+  # 服务器允许外面的 TCP 22 和 80
+  -A INPUT -p tcp -m state --state NEW -m tcp --dport 22 -j ACCEPT 
+  -A INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j SET --add-set WifiQRCode src,src 
+  -A INPUT -p tcp -m state --state NEW -m tcp --dport 80 -j ACCEPT 
+  # 默认数据包 REJECT
+  -A INPUT -j REJECT --reject-with icmp-host-prohibited
+  
+  # 对外发送 UDP 报文即可实现对访客进行授权
+  -A OUTPUT -p udp --dport 3600 -m recent --set --name WifiQRCode3600 --rdest -j ACCEPT
+  -A OUTPUT -p udp --dport 14400 -m recent --set --name WifiQRCode14400 --rdest -j ACCEPT
+  -A OUTPUT -p udp --dport 32400 -m recent --set --name WifiQRCode32400 --rdest -j ACCEPT
+  
+  -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+  # 不管访客是否认证通过，都允许对外的 DNS 请求
+  -A FORWARD -p udp -d 202.118.1.29 --dport 53 -j ACCEPT
+  -A FORWARD -p udp -d 202.118.1.53 --dport 53 -j ACCEPT
+  # 认证过的访客允许对外访问访问
+  -A FORWARD -m recent --update --seconds 3600 --name WifiQRCode3600 --rsource -j ACCEPT
+  -A FORWARD -m recent --rcheck --seconds 14400 --name WifiQRCode14400 --rsource -j ACCEPT
+  -A FORWARD -m recent --rcheck --seconds 32400 --name WifiQRCode32400 --rsource -j ACCEPT
+  # 默认数据包一律 DROP
+  -A FORWARD -j REJECT --reject-with icmp-host-prohibited 
+  
+  COMMIT
+
+=== sysctl.conf
+  net.ipv4.ip_forward = 1
+
+=== ipset
+  create WifiQRCode bitmap:ip,mac range 192.168.96.0-192.168.96.255
+
+=== dhcpd.conf
+  option domain-name "guest.neu.edu.cn";
+  option domain-name-servers 202.118.1.29, 202.118.1.53;
+
+  default-lease-time 600;
+  max-lease-time 7200;
+
+  log-facility local7;
+
+  subnet 192.168.96.0 netmask 255.255.255.0 {
+    range 192.168.96.10 192.168.96.200;
+    option routers 192.168.96.254;
+  }
+
+=== httpd.conf
+
+  AllowOverride All
